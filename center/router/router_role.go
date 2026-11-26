@@ -1,0 +1,172 @@
+package router
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/ccfos/nightingale/v6/center/cconf"
+	"github.com/ccfos/nightingale/v6/models"
+	"github.com/ccfos/nightingale/v6/pkg/ginx"
+
+	"github.com/gin-gonic/gin"
+)
+
+func (rt *Router) rolesGets(c *gin.Context) {
+	lst, err := models.RoleGetsAll(rt.Ctx)
+	ginx.NewRender(c).Data(lst, err)
+}
+
+// hiddenSidebarMenus are FE menu keys we do not expose in /self/perms,
+// so 数据查询 / AI配置 / 关于产品 stay off the sidebar.
+var hiddenSidebarMenus = map[string]struct{}{
+	"/metric/explorer":       {},
+	"/object/explorer":       {},
+	"/metrics-built-in":      {},
+	"/recording-rules":       {},
+	"/recording-rules/add":   {},
+	"/recording-rules/put":   {},
+	"/recording-rules/del":   {},
+	"/log/explorer":          {},
+	"/log/index-patterns":    {},
+	"/ai-config/llm-configs": {},
+	"/ai-config/agents":      {},
+	"/ai-config/skills":      {},
+	"/system/version":        {},
+	"/help/version":          {},
+	"/targets":               {},
+	"/targets/put":           {},
+	"/targets/del":           {},
+	"/targets/bind":          {},
+	"/dashboards":            {},
+	"/dashboards/add":        {},
+	"/dashboards/put":        {},
+	"/dashboards/del":        {},
+	"/public-dashboards":     {},
+	"/embedded-dashboards":   {},
+	"/embedded-products":     {},
+	"/embedded-product/add":  {},
+	"/embedded-product/put":  {},
+	"/embedded-product/delete": {},
+	"/landing":                 {},
+	"/home":                    {},
+	"/overview":                {},
+}
+
+func filterSidebarPerms(lst []string) []string {
+	out := make([]string, 0, len(lst))
+	for _, p := range lst {
+		if _, hide := hiddenSidebarMenus[p]; hide {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// myBalanceAlertMenuPerm is the sidebar key for 我的余额告警. Any logged-in
+// user may open that self-service page, so /self/perms always includes it.
+const myBalanceAlertMenuPerm = "/system/enterprise-balance"
+
+func ensureMyBalanceAlertPerm(lst []string) []string {
+	for _, p := range lst {
+		if p == myBalanceAlertMenuPerm {
+			return lst
+		}
+	}
+	return append(lst, myBalanceAlertMenuPerm)
+}
+
+func (rt *Router) permsGets(c *gin.Context) {
+	user := c.MustGet("user").(*models.User)
+	if user.IsAdmin() {
+		var lst []string
+		for _, ops := range cconf.Operations.Ops {
+			for _, op := range ops.Ops {
+				lst = append(lst, op.Name)
+			}
+		}
+		ginx.NewRender(c).Data(ensureMyBalanceAlertPerm(filterSidebarPerms(lst)), nil)
+		return
+	}
+
+	lst, err := models.OperationsOfRole(rt.Ctx, strings.Fields(user.Roles))
+	ginx.NewRender(c).Data(ensureMyBalanceAlertPerm(filterSidebarPerms(lst)), err)
+}
+
+// 创建角色
+func (rt *Router) roleAdd(c *gin.Context) {
+	var f models.Role
+	ginx.BindJSON(c, &f)
+
+	err := f.Add(rt.Ctx)
+	ginx.NewRender(c).Message(err)
+}
+
+// 更新角色
+func (rt *Router) rolePut(c *gin.Context) {
+	var f models.Role
+	ginx.BindJSON(c, &f)
+	oldRule, err := models.RoleGet(rt.Ctx, "id=?", f.Id)
+	ginx.Dangerous(err)
+
+	if oldRule == nil {
+		ginx.Bomb(http.StatusOK, "role not found")
+	}
+
+	if oldRule.Name == "Admin" {
+		ginx.Bomb(http.StatusOK, "admin role can not be modified")
+	}
+
+	if oldRule.Name != f.Name {
+		// name changed, check duplication
+		num, err := models.RoleCount(rt.Ctx, "name=? and id<>?", f.Name, oldRule.Id)
+		ginx.Dangerous(err)
+
+		if num > 0 {
+			ginx.Bomb(http.StatusOK, "role name already exists")
+		}
+	}
+
+	oldRule.Name = f.Name
+	oldRule.Note = f.Note
+
+	ginx.NewRender(c).Message(oldRule.Update(rt.Ctx, "name", "note"))
+}
+
+func (rt *Router) roleDel(c *gin.Context) {
+	id := ginx.UrlParamInt64(c, "id")
+	target, err := models.RoleGet(rt.Ctx, "id=?", id)
+	ginx.Dangerous(err)
+
+	if target.Name == "Admin" {
+		ginx.Bomb(http.StatusOK, "admin role can not be modified")
+	}
+
+	if target == nil {
+		ginx.NewRender(c).Message(nil)
+		return
+	}
+
+	ginx.NewRender(c).Message(target.Del(rt.Ctx))
+}
+
+// 角色列表
+func (rt *Router) roleGets(c *gin.Context) {
+	lst, err := models.RoleGetsAll(rt.Ctx)
+	ginx.NewRender(c).Data(lst, err)
+}
+
+func (rt *Router) allPerms(c *gin.Context) {
+	roles, err := models.RoleGetsAll(rt.Ctx)
+	ginx.Dangerous(err)
+	m := make(map[string][]string)
+	for _, r := range roles {
+		lst, err := models.OperationsOfRole(rt.Ctx, strings.Fields(r.Name))
+		if err != nil {
+			continue
+		}
+		m[r.Name] = lst
+	}
+
+	ginx.NewRender(c).Data(m, err)
+}

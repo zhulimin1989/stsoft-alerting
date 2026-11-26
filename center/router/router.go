@@ -1,0 +1,805 @@
+package router
+
+import (
+	"fmt"
+	"net/http"
+	"path"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/ccfos/nightingale/v6/alert/aconf"
+	"github.com/ccfos/nightingale/v6/center/cconf"
+	"github.com/ccfos/nightingale/v6/center/cstats"
+	"github.com/ccfos/nightingale/v6/center/metas"
+	"github.com/ccfos/nightingale/v6/center/sso"
+	"github.com/ccfos/nightingale/v6/conf"
+	_ "github.com/ccfos/nightingale/v6/front/statik"
+	"github.com/ccfos/nightingale/v6/memsto"
+	"github.com/ccfos/nightingale/v6/models"
+	"github.com/ccfos/nightingale/v6/pkg/aop"
+	"github.com/ccfos/nightingale/v6/pkg/authing"
+	"github.com/ccfos/nightingale/v6/pkg/ctx"
+	"github.com/ccfos/nightingale/v6/pkg/ginx"
+	"github.com/ccfos/nightingale/v6/pkg/httpx"
+	"github.com/ccfos/nightingale/v6/pkg/version"
+	"github.com/ccfos/nightingale/v6/prom"
+	"github.com/ccfos/nightingale/v6/pushgw/idents"
+	"github.com/ccfos/nightingale/v6/pushgw/pconf"
+	"github.com/ccfos/nightingale/v6/storage"
+	"gorm.io/gorm"
+
+	"github.com/gin-gonic/gin"
+	"github.com/rakyll/statik/fs"
+	"github.com/toolkits/pkg/logger"
+	"github.com/toolkits/pkg/runner"
+)
+
+type Router struct {
+	HTTP              httpx.Config
+	Center            cconf.Center
+	Ibex              conf.Ibex
+	Alert             aconf.Alert
+	Operations        cconf.Operation
+	DatasourceCache   *memsto.DatasourceCacheType
+	NotifyConfigCache *memsto.NotifyConfigCacheType
+	PromClients       *prom.PromClientMap
+	Redis             storage.Redis
+	MetaSet           *metas.Set
+	IdentSet          *idents.Set
+	TargetCache       *memsto.TargetCacheType
+	Sso               *sso.SsoClient
+	UserCache         *memsto.UserCacheType
+	UserGroupCache    *memsto.UserGroupCacheType
+	UserTokenCache    *memsto.UserTokenCacheType
+	Ctx               *ctx.Context
+	LogDir            string
+
+	// Pushgw is this deployment's forwarding config. It is only read to answer
+	// "which datasource do host metrics end up in" (categrafMeta), so it is set
+	// after New() rather than taken as a parameter — an embedder that never
+	// sets it just gets an empty writer list and the UI falls back to letting
+	// the user pick the datasource.
+	Pushgw pconf.Pushgw
+
+	HeartbeatHook         HeartbeatHookFunc
+	TargetDeleteHook      models.TargetDeleteHookFunc
+	TargetDeleteCheck     TargetDeleteCheckFunc
+	TargetBgidChangeCheck TargetBgidChangeCheckFunc
+	AlertRuleModifyHook   AlertRuleModifyHookFunc
+
+	AuthingOTP authing.PhoneCodes
+}
+
+// TargetDeleteCheckFunc 删除机器前的前置校验，返回不满足删除条件的机器及原因（ident -> 错误信息）。
+// 返回的 map 为空表示全部机器均可删除。
+type TargetDeleteCheckFunc func(idents []string) map[string]string
+
+// TargetBgidChangeCheckFunc 机器变更业务组（del/reset）前的前置校验，返回不满足变更条件的机器及
+// 原因（ident -> 错误信息）。返回的 map 为空表示全部机器均可变更；error 用于内部错误（如 DB 查询失败）。
+type TargetBgidChangeCheckFunc func(idents []string, action string, bgids []int64) (map[string]string, error)
+
+func New(httpConfig httpx.Config, center cconf.Center, alert aconf.Alert, ibex conf.Ibex,
+	operations cconf.Operation, ds *memsto.DatasourceCacheType, ncc *memsto.NotifyConfigCacheType,
+	pc *prom.PromClientMap, redis storage.Redis,
+	sso *sso.SsoClient, ctx *ctx.Context, metaSet *metas.Set, idents *idents.Set,
+	tc *memsto.TargetCacheType, uc *memsto.UserCacheType, ugc *memsto.UserGroupCacheType, utc *memsto.UserTokenCacheType, logDir string) *Router {
+	rt := &Router{
+		HTTP:                  httpConfig,
+		Center:                center,
+		Alert:                 alert,
+		Ibex:                  ibex,
+		Operations:            operations,
+		DatasourceCache:       ds,
+		NotifyConfigCache:     ncc,
+		PromClients:           pc,
+		Redis:                 redis,
+		MetaSet:               metaSet,
+		IdentSet:              idents,
+		TargetCache:           tc,
+		Sso:                   sso,
+		UserCache:             uc,
+		UserGroupCache:        ugc,
+		UserTokenCache:        utc,
+		Ctx:                   ctx,
+		LogDir:                logDir,
+		HeartbeatHook:         func(ident string) map[string]interface{} { return nil },
+		AlertRuleModifyHook:   func(ar *models.AlertRule) {},
+		TargetDeleteHook:      func(tx *gorm.DB, idents []string, force bool) error { return nil },
+		TargetDeleteCheck:     func(idents []string) map[string]string { return nil },
+		TargetBgidChangeCheck: func(idents []string, action string, bgids []int64) (map[string]string, error) { return nil, nil },
+		AuthingOTP: authing.Lazy(authing.Config{
+			AppHost:     center.Authing.AppHost,
+			AppID:       center.Authing.AppID,
+			AppSecret:   center.Authing.AppSecret,
+			RedirectURI: center.Authing.RedirectURI,
+		}),
+	}
+
+	return rt
+}
+
+func stat() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+
+		code := fmt.Sprintf("%d", c.Writer.Status())
+		method := c.Request.Method
+		labels := []string{code, c.FullPath(), method}
+
+		cstats.RequestDuration.WithLabelValues(labels...).Observe(time.Since(start).Seconds())
+	}
+}
+
+func languageDetector(i18NHeaderKey string) gin.HandlerFunc {
+	headerKey := i18NHeaderKey
+	return func(c *gin.Context) {
+		if headerKey != "" {
+			lang := c.GetHeader(headerKey)
+			if lang != "" {
+				if strings.HasPrefix(lang, "zh_HK") {
+					c.Request.Header.Set("X-Language", "zh_HK")
+				} else if strings.HasPrefix(lang, "zh") {
+					c.Request.Header.Set("X-Language", "zh_CN")
+				} else if strings.HasPrefix(lang, "en") {
+					c.Request.Header.Set("X-Language", "en")
+				} else {
+					c.Request.Header.Set("X-Language", lang)
+				}
+			} else {
+				c.Request.Header.Set("X-Language", "zh_CN")
+			}
+		}
+		c.Next()
+	}
+}
+
+func (rt *Router) configNoRoute(r *gin.Engine, fs *http.FileSystem) {
+	r.NoRoute(func(c *gin.Context) {
+		arr := strings.Split(c.Request.URL.Path, ".")
+		suffix := arr[len(arr)-1]
+
+		switch suffix {
+		// 前端发布包里出现的静态资源后缀都要列在这里，否则会被当成前端路由返回 index.html。
+		// 新增前端资源类型（如 n9e-collect-templates/*.toml、字体 woff2）时记得同步补充
+		case "png", "jpeg", "jpg", "svg", "ico", "gif", "css", "js", "html", "htm", "gz", "zip", "map", "ttf", "woff2", "md", "toml":
+			if !rt.Center.UseFileAssets {
+				c.FileFromFS(c.Request.URL.Path, *fs)
+			} else {
+				cwdarr := []string{"/"}
+				if runtime.GOOS == "windows" {
+					cwdarr[0] = ""
+				}
+				cwdarr = append(cwdarr, strings.Split(runner.Cwd, "/")...)
+				cwdarr = append(cwdarr, "pub")
+				cwdarr = append(cwdarr, strings.Split(c.Request.URL.Path, "/")...)
+				c.File(path.Join(cwdarr...))
+			}
+		default:
+			p := c.Request.URL.Path
+			if strings.HasPrefix(p, "/api/") {
+				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"err": "not found", "request_id": c.GetString("trace_id")})
+				return
+			}
+			if isRemovedSPA(p) {
+				c.String(http.StatusNotFound, "not found")
+				return
+			}
+			c.Header("Cache-Control", "no-store")
+			if !rt.Center.UseFileAssets {
+				c.FileFromFS("/", *fs)
+			} else {
+				cwdarr := []string{"/"}
+				if runtime.GOOS == "windows" {
+					cwdarr[0] = ""
+				}
+				cwdarr = append(cwdarr, strings.Split(runner.Cwd, "/")...)
+				cwdarr = append(cwdarr, "pub")
+				cwdarr = append(cwdarr, "index.html")
+				c.File(path.Join(cwdarr...))
+			}
+		}
+	})
+}
+
+func (rt *Router) Config(r *gin.Engine) {
+
+	r.Use(stat())
+	r.Use(languageDetector(rt.Center.I18NHeaderKey))
+	r.Use(aop.Recovery())
+
+	statikFS, err := fs.New()
+	if err != nil {
+		logger.Errorf("cannot create statik fs: %v", err)
+	}
+
+	if !rt.Center.UseFileAssets {
+		r.StaticFS("/pub", statikFS)
+	}
+
+	pagesPrefix := "/api/n9e"
+	pages := r.Group(pagesPrefix)
+	pages.Use(rt.blockRemovedAPIs())
+	{
+
+		pages.DELETE("/datasource/series", rt.auth(), rt.admin(), rt.deleteDatasourceSeries)
+		if rt.Center.AnonymousAccess.PromQuerier {
+			pages.Any("/proxy/:id/*url", rt.dsProxy)
+			pages.POST("/v2/query-batch", rt.queryBatchV2)
+			pages.POST("/query-range-batch", rt.promBatchQueryRange)
+			pages.POST("/query-instant-batch", rt.promBatchQueryInstant)
+			pages.GET("/datasource/brief", rt.datasourceBriefs)
+			pages.POST("/datasource/query", rt.datasourceQuery)
+
+			pages.POST("/ds-query", rt.QueryData)
+			pages.POST("/logs-query", rt.QueryLogV2)
+
+			pages.POST("/tdengine-databases", rt.tdengineDatabases)
+			pages.POST("/tdengine-tables", rt.tdengineTables)
+			pages.POST("/tdengine-columns", rt.tdengineColumns)
+			pages.POST("/iotdb-databases", rt.iotdbDatabases)
+			pages.POST("/iotdb-tables", rt.iotdbTables)
+			pages.POST("/iotdb-columns", rt.iotdbColumns)
+			pages.POST("/victorialogs-histogram", rt.QueryVictoriaLogsHistogram)
+			pages.POST("/victorialogs-field-names", rt.QueryVictoriaLogsFieldNames)
+			pages.POST("/victorialogs-field-values", rt.QueryVictoriaLogsFieldValues)
+			pages.POST("/loki-label-names", rt.QueryLokiLabelNames)
+			pages.POST("/loki-label-values", rt.QueryLokiLabelValues)
+			pages.POST("/loki-parsed-fields", rt.QueryLokiParsedFields)
+			pages.POST("/loki-histogram", rt.QueryLokiHistogram)
+
+			pages.POST("/log-query-batch", rt.QueryLogBatch)
+
+			// 数据库元数据接口
+			pages.POST("/db-databases", rt.ShowDatabases)
+			pages.POST("/db-tables", rt.ShowTables)
+			pages.POST("/db-desc-table", rt.DescribeTable)
+
+			// es 专用接口
+			pages.POST("/indices", rt.QueryIndices)
+			pages.POST("/es-variable", rt.QueryESVariable)
+			pages.POST("/fields", rt.QueryFields)
+			pages.POST("/log-query", rt.QueryLog)
+			pages.POST("/es-cluster-info", rt.ESClusterInfo)
+		} else {
+			// proxy 也纳入分享 token 通道：dsProxy 内部按板内集合校验数据源，并只放行
+			// 只读查询路径（见 router_board_share.go isReadOnlyProxyPath），供 ES 面板与
+			// query 类型变量在匿名分享下取数；非 token 请求照常登录鉴权
+			pages.Any("/proxy/:id/*url", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), rt.dsProxy)
+			// 仪表盘限时分享：带有效 board 分享 token 的匿名请求可走以下查询接口，
+			// 数据源被收敛到板内引用集合（见 router_board_share.go），其余照常登录鉴权
+			pages.POST("/v2/query-batch", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), skipIfBoardToken(rt.user()), rt.queryBatchV2)
+			pages.POST("/query-range-batch", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), rt.promBatchQueryRange)
+			pages.POST("/query-instant-batch", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), rt.promBatchQueryInstant)
+			pages.GET("/datasource/brief", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), skipIfBoardToken(rt.user()), rt.datasourceBriefs)
+			pages.POST("/datasource/query", rt.auth(), rt.user(), rt.datasourceQuery)
+
+			pages.POST("/ds-query", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), skipIfBoardToken(rt.user()), rt.QueryData)
+			pages.POST("/logs-query", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), skipIfBoardToken(rt.user()), rt.QueryLogV2)
+
+			pages.POST("/tdengine-databases", rt.auth(), rt.tdengineDatabases)
+			pages.POST("/tdengine-tables", rt.auth(), rt.tdengineTables)
+			pages.POST("/tdengine-columns", rt.auth(), rt.tdengineColumns)
+			pages.POST("/iotdb-databases", rt.auth(), rt.iotdbDatabases)
+			pages.POST("/iotdb-tables", rt.auth(), rt.iotdbTables)
+			pages.POST("/iotdb-columns", rt.auth(), rt.iotdbColumns)
+			pages.POST("/victorialogs-histogram", rt.auth(), rt.user(), rt.QueryVictoriaLogsHistogram)
+			pages.POST("/victorialogs-field-names", rt.auth(), rt.user(), rt.QueryVictoriaLogsFieldNames)
+			pages.POST("/victorialogs-field-values", rt.auth(), rt.user(), rt.QueryVictoriaLogsFieldValues)
+			pages.POST("/loki-label-names", rt.auth(), rt.user(), rt.QueryLokiLabelNames)
+			pages.POST("/loki-label-values", rt.auth(), rt.user(), rt.QueryLokiLabelValues)
+			pages.POST("/loki-parsed-fields", rt.auth(), rt.user(), rt.QueryLokiParsedFields)
+			pages.POST("/loki-histogram", rt.auth(), rt.user(), rt.QueryLokiHistogram)
+
+			pages.POST("/log-query-batch", rt.boardTokenDetect(), skipIfBoardToken(rt.auth()), skipIfBoardToken(rt.user()), rt.QueryLogBatch)
+
+			// 数据库元数据接口
+			pages.POST("/db-databases", rt.auth(), rt.user(), rt.ShowDatabases)
+			pages.POST("/db-tables", rt.auth(), rt.user(), rt.ShowTables)
+			pages.POST("/db-desc-table", rt.auth(), rt.user(), rt.DescribeTable)
+
+			// es 专用接口
+			pages.POST("/indices", rt.auth(), rt.user(), rt.QueryIndices)
+			pages.POST("/es-variable", rt.auth(), rt.user(), rt.QueryESVariable)
+			pages.POST("/fields", rt.auth(), rt.user(), rt.QueryFields)
+			pages.POST("/log-query", rt.auth(), rt.user(), rt.QueryLog)
+			pages.POST("/es-cluster-info", rt.auth(), rt.user(), rt.ESClusterInfo)
+		}
+
+		// OpenSearch 专用接口
+		pages.POST("/os-indices", rt.QueryOSIndices)
+		pages.POST("/os-variable", rt.QueryOSVariable)
+		pages.POST("/os-fields", rt.QueryOSFields)
+
+		pages.GET("/sql-template", rt.auth(), rt.user(), rt.QuerySqlTemplate)
+		pages.POST("/auth/login", rt.jwtMock(), rt.loginPost)
+		pages.POST("/auth/logout", rt.jwtMock(), rt.auth(), rt.user(), rt.logoutPost)
+		pages.POST("/auth/refresh", rt.jwtMock(), rt.refreshPost)
+		pages.POST("/auth/captcha", rt.jwtMock(), rt.generateCaptcha)
+		pages.POST("/auth/captcha-verify", rt.jwtMock(), rt.captchaVerify)
+		pages.GET("/auth/ifshowcaptcha", rt.ifShowCaptcha)
+
+		pages.GET("/auth/sso-config", rt.ssoConfigNameGet)
+		pages.GET("/auth/rsa-config", rt.rsaConfigGet)
+		pages.GET("/auth/redirect", rt.loginRedirect)
+		pages.GET("/auth/redirect/cas", rt.loginRedirectCas)
+		pages.GET("/auth/redirect/oauth", rt.loginRedirectOAuth)
+		pages.GET("/auth/redirect/dingtalk", rt.loginRedirectDingTalk)
+		pages.GET("/auth/redirect/feishu", rt.loginRedirectFeiShu)
+		pages.GET("/auth/callback", rt.loginCallback)
+		pages.GET("/auth/callback/cas", rt.loginCallbackCas)
+		pages.GET("/auth/callback/oauth", rt.loginCallbackOAuth)
+		pages.GET("/auth/callback/dingtalk", rt.loginCallbackDingTalk)
+		pages.GET("/auth/callback/feishu", rt.loginCallbackFeiShu)
+		pages.GET("/auth/perms", rt.auth(), rt.user(), rt.allPerms)
+
+		pages.GET("/metrics/desc", rt.auth(), rt.user(), rt.metricsDescGetFile)
+		pages.POST("/metrics/desc", rt.auth(), rt.user(), rt.metricsDescGetMap)
+
+		pages.GET("/notify-channels", rt.auth(), rt.user(), rt.notifyChannelsGets)
+		pages.GET("/contact-keys", rt.auth(), rt.user(), rt.contactKeysGets)
+		pages.GET("/install-date", rt.auth(), rt.user(), rt.installDateGet)
+
+		pages.GET("/self/perms", rt.auth(), rt.user(), rt.permsGets)
+		pages.GET("/self/profile", rt.auth(), rt.user(), rt.selfProfileGet)
+		pages.PUT("/self/profile", rt.auth(), rt.user(), rt.selfProfilePut)
+		pages.PUT("/self/password", rt.auth(), rt.user(), rt.selfPasswordPut)
+		pages.GET("/self/token", rt.auth(), rt.user(), rt.getToken)
+		pages.POST("/self/token", rt.auth(), rt.user(), rt.addToken)
+		pages.DELETE("/self/token/:id", rt.auth(), rt.user(), rt.deleteToken)
+
+		pages.GET("/users", rt.auth(), rt.user(), rt.perm("/users"), rt.userGets)
+		pages.POST("/users", rt.auth(), rt.user(), rt.perm("/users/add"), rt.userAddPost)
+		pages.POST("/users/sync-billing", rt.auth(), rt.user(), rt.perm("/users/add"), rt.usersSyncBilling)
+		pages.GET("/user/:id/profile", rt.auth(), rt.userProfileGet)
+		pages.PUT("/user/:id/profile", rt.auth(), rt.user(), rt.perm("/users/put"), rt.userProfilePut)
+		pages.PUT("/user/:id/password", rt.auth(), rt.user(), rt.perm("/users/put"), rt.userPasswordPut)
+		pages.PUT("/user/:id/disabled", rt.auth(), rt.user(), rt.perm("/users/put"), rt.userDisabledPut)
+		pages.DELETE("/user/:id", rt.auth(), rt.user(), rt.perm("/users/del"), rt.userDel)
+
+		pages.GET("/user-groups", rt.auth(), rt.user(), rt.userGroupGets)
+		pages.POST("/user-groups", rt.auth(), rt.user(), rt.perm("/user-groups/add"), rt.userGroupAdd)
+		pages.GET("/user-group/:id", rt.auth(), rt.user(), rt.userGroupWrite(), rt.userGroupGet)
+		pages.PUT("/user-group/:id", rt.auth(), rt.user(), rt.perm("/user-groups/put"), rt.userGroupWrite(), rt.userGroupPut)
+		pages.DELETE("/user-group/:id", rt.auth(), rt.user(), rt.perm("/user-groups/del"), rt.userGroupWrite(), rt.userGroupDel)
+		pages.POST("/user-group/:id/members", rt.auth(), rt.user(), rt.perm("/user-groups/put"), rt.userGroupWrite(), rt.userGroupMemberAdd)
+		pages.DELETE("/user-group/:id/members", rt.auth(), rt.user(), rt.perm("/user-groups/put"), rt.userGroupWrite(), rt.userGroupMemberDel)
+
+		pages.GET("/busi-groups", rt.auth(), rt.user(), rt.busiGroupGets)
+		pages.POST("/busi-groups", rt.auth(), rt.user(), rt.perm("/busi-groups/add"), rt.busiGroupAdd)
+		pages.GET("/busi-groups/alertings", rt.auth(), rt.busiGroupAlertingsGets)
+		pages.GET("/busi-group/:id", rt.auth(), rt.user(), rt.bgro(), rt.busiGroupGet)
+		pages.PUT("/busi-group/:id", rt.auth(), rt.user(), rt.perm("/busi-groups/put"), rt.bgrw(), rt.busiGroupPut)
+		pages.POST("/busi-group/:id/members", rt.auth(), rt.user(), rt.perm("/busi-groups/put"), rt.bgrw(), rt.busiGroupMemberAdd)
+		pages.DELETE("/busi-group/:id/members", rt.auth(), rt.user(), rt.perm("/busi-groups/put"), rt.bgrw(), rt.busiGroupMemberDel)
+		pages.DELETE("/busi-group/:id", rt.auth(), rt.user(), rt.perm("/busi-groups/del"), rt.bgrw(), rt.busiGroupDel)
+		pages.GET("/busi-group/:id/perm/:perm", rt.auth(), rt.user(), rt.checkBusiGroupPerm)
+		pages.GET("/busi-groups/tags", rt.auth(), rt.user(), rt.busiGroupsGetTags)
+
+		// Infrastructure / dashboards / recording-rules / AI are out of the prepaid-balance product.
+
+		pages.POST("/builtin-cate-favorite", rt.auth(), rt.user(), rt.builtinCateFavoriteAdd)
+		pages.DELETE("/builtin-cate-favorite/:name", rt.auth(), rt.user(), rt.builtinCateFavoriteDel)
+
+		pages.GET("/integrations/icon/:cate/:name", rt.builtinIcon)
+
+		pages.GET("/alert-rules/callbacks", rt.auth(), rt.user(), rt.alertRuleCallbacks)
+		pages.GET("/timezones", rt.auth(), rt.user(), rt.timezonesGet)
+
+		pages.GET("/busi-groups/alert-rules", rt.auth(), rt.user(), rt.perm("/alert-rules"), rt.alertRuleGetsByGids)
+		pages.GET("/busi-group/:id/alert-rules", rt.auth(), rt.user(), rt.perm("/alert-rules"), rt.alertRuleGets)
+		pages.POST("/busi-group/:id/alert-rules", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.bgrw(), rt.alertRuleAddByFE)
+		pages.POST("/busi-group/:id/alert-rules/import", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.bgrw(), rt.alertRuleAddByImport)
+		pages.POST("/busi-group/:id/alert-rules/import-prom-rule", rt.auth(),
+			rt.user(), rt.perm("/alert-rules/add"), rt.bgrw(), rt.alertRuleAddByImportPromRule)
+		pages.DELETE("/busi-group/:id/alert-rules", rt.auth(), rt.user(), rt.perm("/alert-rules/del"), rt.bgrw(), rt.alertRuleDel)
+		pages.PUT("/busi-group/:id/alert-rules/fields", rt.auth(), rt.user(), rt.perm("/alert-rules/put"), rt.bgrw(), rt.alertRulePutFields)
+		pages.PUT("/busi-group/:id/alert-rule/:arid", rt.auth(), rt.user(), rt.perm("/alert-rules/put"), rt.alertRulePutByFE)
+		pages.GET("/alert-rule/:arid", rt.auth(), rt.user(), rt.perm("/alert-rules"), rt.alertRuleGet)
+		pages.GET("/alert-rule/:arid/pure", rt.auth(), rt.user(), rt.perm("/alert-rules"), rt.alertRulePureGet)
+		pages.PUT("/busi-group/alert-rule/validate", rt.auth(), rt.user(), rt.perm("/alert-rules/put"), rt.alertRuleValidation)
+		pages.POST("/relabel-test", rt.auth(), rt.user(), rt.relabelTest)
+		pages.POST("/busi-group/:id/alert-rules/clone", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.bgrw(), rt.cloneToMachine)
+		pages.POST("/busi-groups/alert-rules/clones", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.batchAlertRuleClone)
+		pages.POST("/busi-group/alert-rules/notify-tryrun", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.alertRuleNotifyTryRun)
+		pages.POST("/busi-group/alert-rules/enable-tryrun", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.alertRuleEnableTryRun)
+		pages.POST("/busi-group/:id/alert-rule/test-fire", rt.auth(), rt.user(), rt.perm("/alert-rules/add"), rt.bgrw(), rt.alertRuleTestFire)
+
+		pages.GET("/busi-groups/alert-mutes", rt.auth(), rt.user(), rt.perm("/alert-mutes"), rt.alertMuteGetsByGids)
+		pages.GET("/busi-group/:id/alert-mutes", rt.auth(), rt.user(), rt.perm("/alert-mutes"), rt.bgro(), rt.alertMuteGetsByBG)
+		pages.POST("/busi-group/:id/alert-mutes/preview", rt.auth(), rt.user(), rt.perm("/alert-mutes/add"), rt.bgrw(), rt.alertMutePreview)
+		pages.POST("/busi-group/:id/alert-mutes", rt.auth(), rt.user(), rt.perm("/alert-mutes/add"), rt.bgrw(), rt.alertMuteAdd)
+		pages.DELETE("/busi-group/:id/alert-mutes", rt.auth(), rt.user(), rt.perm("/alert-mutes/del"), rt.bgrw(), rt.alertMuteDel)
+		pages.PUT("/busi-group/:id/alert-mute/:amid", rt.auth(), rt.user(), rt.perm("/alert-mutes/put"), rt.alertMutePutByFE)
+		pages.GET("/busi-group/:id/alert-mute/:amid", rt.auth(), rt.user(), rt.perm("/alert-mutes"), rt.alertMuteGet)
+		pages.PUT("/busi-group/:id/alert-mutes/fields", rt.auth(), rt.user(), rt.perm("/alert-mutes/put"), rt.bgrw(), rt.alertMutePutFields)
+		pages.POST("/alert-mute-tryrun", rt.auth(), rt.user(), rt.perm("/alert-mutes/add"), rt.alertMuteTryRun)
+		pages.DELETE("/alert-mutes", rt.auth(), rt.admin(), rt.alertMuteBatchDelete)
+
+		pages.GET("/busi-groups/alert-subscribes", rt.auth(), rt.user(), rt.perm("/alert-subscribes"), rt.alertSubscribeGetsByGids)
+		pages.GET("/busi-group/:id/alert-subscribes", rt.auth(), rt.user(), rt.perm("/alert-subscribes"), rt.bgro(), rt.alertSubscribeGets)
+		pages.GET("/alert-subscribe/:sid", rt.auth(), rt.user(), rt.perm("/alert-subscribes"), rt.alertSubscribeGet)
+		pages.POST("/busi-group/:id/alert-subscribes", rt.auth(), rt.user(), rt.perm("/alert-subscribes/add"), rt.bgrw(), rt.alertSubscribeAdd)
+		pages.PUT("/busi-group/:id/alert-subscribes", rt.auth(), rt.user(), rt.perm("/alert-subscribes/put"), rt.bgrw(), rt.alertSubscribePut)
+		pages.DELETE("/busi-group/:id/alert-subscribes", rt.auth(), rt.user(), rt.perm("/alert-subscribes/del"), rt.bgrw(), rt.alertSubscribeDel)
+		pages.POST("/alert-subscribe/alert-subscribes-tryrun", rt.auth(), rt.user(), rt.perm("/alert-subscribes/add"), rt.alertSubscribeTryRun)
+
+		pages.GET("/alert-cur-event/:eid", rt.alertCurEventGet)
+		pages.GET("/alert-his-event/:eid", rt.alertHisEventGet)
+		pages.GET("/event-notify-records/:eid", rt.notificationRecordList)
+		pages.GET("/notification-records/used", rt.auth(), rt.user(), rt.notificationRecordUsed)
+		pages.GET("/event-detail/:hash", rt.eventDetailPage)
+		pages.GET("/event-detail/:hash/logs", rt.auth(), rt.user(), rt.eventDetailJSON)
+		pages.GET("/alert-eval-detail/:id", rt.alertEvalDetailPage)
+		pages.GET("/alert-eval-detail/:id/logs", rt.auth(), rt.user(), rt.alertEvalDetailJSON)
+		pages.GET("/alert-rule/:arid/eval-records", rt.auth(), rt.user(), rt.perm("/alert-rules"), rt.alertRuleEvalRecords)
+		pages.GET("/trace-logs/:traceid", rt.traceLogsPage)
+		pages.GET("/trace-logs/:traceid/logs", rt.auth(), rt.user(), rt.traceLogsJSON)
+
+		// card logic
+		pages.GET("/alert-cur-events/list", rt.auth(), rt.user(), rt.alertCurEventsList)
+		pages.POST("/alert-cur-events/list", rt.auth(), rt.user(), rt.alertCurEventsList)
+		pages.GET("/alert-cur-events/card", rt.auth(), rt.user(), rt.alertCurEventsCard)
+		pages.POST("/alert-cur-events/card/details", rt.auth(), rt.alertCurEventsCardDetails)
+		pages.GET("/alert-his-events/list", rt.auth(), rt.user(), rt.alertHisEventsList)
+		pages.DELETE("/alert-his-events", rt.auth(), rt.admin(), rt.alertHisEventsDelete)
+		pages.DELETE("/alert-cur-events", rt.auth(), rt.user(), rt.perm("/alert-cur-events/del"), rt.alertCurEventDel)
+		pages.GET("/alert-cur-events/stats", rt.auth(), rt.alertCurEventsStatistics)
+
+		pages.GET("/alert-aggr-views", rt.auth(), rt.alertAggrViewGets)
+		pages.DELETE("/alert-aggr-views", rt.auth(), rt.user(), rt.alertAggrViewDel)
+		pages.POST("/alert-aggr-views", rt.auth(), rt.user(), rt.alertAggrViewAdd)
+		pages.PUT("/alert-aggr-views", rt.auth(), rt.user(), rt.alertAggrViewPut)
+
+		pages.GET("/busi-groups/task-tpls", rt.auth(), rt.user(), rt.perm("/job-tpls"), rt.taskTplGetsByGids)
+		pages.GET("/busi-group/:id/task-tpls", rt.auth(), rt.user(), rt.perm("/job-tpls"), rt.bgro(), rt.taskTplGets)
+		pages.POST("/busi-group/:id/task-tpls", rt.auth(), rt.user(), rt.perm("/job-tpls/add"), rt.bgrw(), rt.taskTplAdd)
+		pages.DELETE("/busi-group/:id/task-tpl/:tid", rt.auth(), rt.user(), rt.perm("/job-tpls/del"), rt.bgrw(), rt.taskTplDel)
+		pages.POST("/busi-group/:id/task-tpls/tags", rt.auth(), rt.user(), rt.perm("/job-tpls/put"), rt.bgrw(), rt.taskTplBindTags)
+		pages.DELETE("/busi-group/:id/task-tpls/tags", rt.auth(), rt.user(), rt.perm("/job-tpls/put"), rt.bgrw(), rt.taskTplUnbindTags)
+		pages.GET("/busi-group/:id/task-tpl/:tid", rt.auth(), rt.user(), rt.perm("/job-tpls"), rt.bgro(), rt.taskTplGet)
+		pages.PUT("/busi-group/:id/task-tpl/:tid", rt.auth(), rt.user(), rt.perm("/job-tpls/put"), rt.bgrw(), rt.taskTplPut)
+
+		pages.GET("/busi-groups/tasks", rt.auth(), rt.user(), rt.perm("/job-tasks"), rt.taskGetsByGids)
+		pages.GET("/busi-group/:id/tasks", rt.auth(), rt.user(), rt.perm("/job-tasks"), rt.bgro(), rt.taskGets)
+		pages.POST("/busi-group/:id/tasks", rt.auth(), rt.user(), rt.perm("/job-tasks/add"), rt.bgrw(), rt.taskAdd)
+
+		pages.GET("/servers", rt.auth(), rt.user(), rt.perm("/system/alerting-engines"), rt.serversGet)
+		pages.GET("/server-clusters", rt.auth(), rt.user(), rt.serverClustersGet)
+
+		pages.POST("/datasource/list", rt.auth(), rt.user(), rt.datasourceList)
+		pages.POST("/datasource/plugin/list", rt.auth(), rt.pluginList)
+		pages.POST("/datasource/upsert", rt.auth(), rt.admin(), rt.datasourceUpsert)
+		pages.POST("/datasource/grafana/fetch", rt.auth(), rt.admin(), rt.datasourceGrafanaFetch)
+		pages.POST("/datasource/grafana/import", rt.auth(), rt.admin(), rt.datasourceGrafanaImport)
+		pages.POST("/datasource/desc", rt.auth(), rt.admin(), rt.datasourceGet)
+		pages.POST("/datasource/status/update", rt.auth(), rt.admin(), rt.datasourceUpdataStatus)
+		pages.DELETE("/datasource/", rt.auth(), rt.admin(), rt.datasourceDel)
+		// 模板匹配是只读探测，普通用户可用；导入动作的权限由业务组/payload 接口各自把关
+		pages.POST("/datasource/template-match", rt.auth(), rt.user(), rt.datasourceTemplateMatch)
+
+		pages.GET("/roles", rt.auth(), rt.user(), rt.roleGets)
+		pages.POST("/roles", rt.auth(), rt.user(), rt.perm("/roles/add"), rt.roleAdd)
+		pages.PUT("/roles", rt.auth(), rt.user(), rt.perm("/roles/put"), rt.rolePut)
+		pages.DELETE("/role/:id", rt.auth(), rt.user(), rt.perm("/roles/del"), rt.roleDel)
+
+		pages.GET("/role/:id/ops", rt.auth(), rt.user(), rt.perm("/roles"), rt.operationOfRole)
+		pages.PUT("/role/:id/ops", rt.auth(), rt.user(), rt.perm("/roles/put"), rt.roleBindOperation)
+		pages.GET("/operation", rt.auth(), rt.user(), rt.operations)
+
+		pages.GET("/notify-tpls", rt.auth(), rt.user(), rt.notifyTplGets)
+		pages.PUT("/notify-tpl/content", rt.auth(), rt.user(), rt.notifyTplUpdateContent)
+		pages.PUT("/notify-tpl", rt.auth(), rt.user(), rt.notifyTplUpdate)
+		pages.POST("/notify-tpl", rt.auth(), rt.user(), rt.notifyTplAdd)
+		pages.DELETE("/notify-tpl/:id", rt.auth(), rt.user(), rt.notifyTplDel)
+		pages.POST("/notify-tpl/preview", rt.auth(), rt.user(), rt.notifyTplPreview)
+
+		pages.GET("/sso-configs", rt.auth(), rt.admin(), rt.ssoConfigGets)
+		pages.PUT("/sso-config", rt.auth(), rt.admin(), rt.ssoConfigUpdate)
+
+		pages.GET("/webhooks", rt.auth(), rt.user(), rt.webhookGets)
+		pages.PUT("/webhooks", rt.auth(), rt.admin(), rt.webhookPuts)
+
+		pages.GET("/notify-script", rt.auth(), rt.user(), rt.perm("/help/notification-settings"), rt.notifyScriptGet)
+		pages.PUT("/notify-script", rt.auth(), rt.admin(), rt.notifyScriptPut)
+
+		pages.GET("/notify-channel", rt.auth(), rt.user(), rt.perm("/help/notification-settings"), rt.notifyChannelGets)
+		pages.PUT("/notify-channel", rt.auth(), rt.admin(), rt.notifyChannelPuts)
+
+		pages.GET("/notify-contact", rt.auth(), rt.user(), rt.notifyContactGets)
+		pages.PUT("/notify-contact", rt.auth(), rt.admin(), rt.notifyContactPuts)
+
+		pages.GET("/notify-config", rt.auth(), rt.user(), rt.perm("/help/notification-settings"), rt.notifyConfigGet)
+		pages.PUT("/notify-config", rt.auth(), rt.admin(), rt.notifyConfigPut)
+		pages.PUT("/smtp-config-test", rt.auth(), rt.admin(), rt.attemptSendEmail)
+
+		pages.GET("/user-variable-configs", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigGets)
+		pages.POST("/user-variable-config", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigAdd)
+		pages.PUT("/user-variable-config/:id", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigPut)
+		pages.DELETE("/user-variable-config/:id", rt.auth(), rt.user(), rt.perm("/system/variable-settings"), rt.userVariableConfigDel)
+
+		pages.GET("/config", rt.auth(), rt.admin(), rt.configGetByKey)
+		pages.PUT("/config", rt.auth(), rt.admin(), rt.configPutByKey)
+
+		pages.GET("/balance-alert/notify-rules", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertNotifyRulesGet)
+		pages.GET("/balance-alert/settings", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertSettingsGet)
+		pages.PUT("/balance-alert/settings", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertSettingsPut)
+		pages.GET("/balance-alert/records", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertRecordsGet)
+		pages.GET("/balance-alert/configs", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertConfigsGet)
+		pages.GET("/balance-alert/config/:account_id", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertConfigGet)
+		pages.PUT("/balance-alert/config/:account_id", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertConfigPut)
+		pages.PUT("/balance-alert/records/:id/review", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertRecordReview)
+		pages.POST("/balance-alert/run", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertRun)
+		pages.GET("/balance-alert/exclude-state", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertExcludeStateGet)
+		pages.GET("/balance-alert/excludes", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertExcludesGet)
+		pages.POST("/balance-alert/exclude-refresh", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertExcludeRefresh)
+		pages.GET("/balance-alert/miss-reports", rt.auth(), rt.user(), rt.perm("/system/balance-alert"), rt.balanceAlertMissReports)
+
+		pages.GET("/balance-alert/my-config", rt.auth(), rt.user(), rt.balanceAlertMyConfigGet)
+		pages.PUT("/balance-alert/my-config", rt.auth(), rt.user(), rt.balanceAlertMyConfigPut)
+		pages.POST("/balance-alert/my-config/otp", rt.auth(), rt.user(), rt.balanceAlertMyOTPSend)
+		pages.POST("/balance-alert/my-config/otp/verify", rt.auth(), rt.user(), rt.balanceAlertMyOTPVerify)
+		pages.GET("/balance-alert/my-records", rt.auth(), rt.user(), rt.balanceAlertMyRecordsGet)
+		pages.GET("/balance-alert/my-status", rt.auth(), rt.user(), rt.balanceAlertMyStatusGet)
+		pages.GET("/site-info", rt.siteInfo)
+
+		// source token 相关路由
+		pages.POST("/source-token", rt.auth(), rt.user(), rt.sourceTokenAdd)
+		pages.GET("/source-tokens", rt.auth(), rt.user(), rt.sourceTokenGets)
+		pages.DELETE("/source-token/:id", rt.auth(), rt.user(), rt.sourceTokenDel)
+
+		// for admin api
+		pages.GET("/user/busi-groups", rt.auth(), rt.admin(), rt.userBusiGroupsGets)
+
+		pages.GET("/builtin-components", rt.auth(), rt.user(), rt.builtinComponentsGets)
+		pages.POST("/builtin-components", rt.auth(), rt.user(), rt.perm("/components/add"), rt.builtinComponentsAdd)
+		pages.PUT("/builtin-components", rt.auth(), rt.user(), rt.perm("/components/put"), rt.builtinComponentsPut)
+		pages.DELETE("/builtin-components", rt.auth(), rt.user(), rt.perm("/components/del"), rt.builtinComponentsDel)
+
+		pages.GET("/builtin-payloads", rt.auth(), rt.user(), rt.builtinPayloadsGets)
+		pages.GET("/builtin-payloads/cates", rt.auth(), rt.user(), rt.builtinPayloadcatesGet)
+		pages.POST("/builtin-payloads", rt.auth(), rt.user(), rt.perm("/components/add"), rt.builtinPayloadsAdd)
+		pages.PUT("/builtin-payloads", rt.auth(), rt.user(), rt.perm("/components/put"), rt.builtinPayloadsPut)
+		pages.DELETE("/builtin-payloads", rt.auth(), rt.user(), rt.perm("/components/del"), rt.builtinPayloadsDel)
+		pages.GET("/builtin-payload", rt.auth(), rt.user(), rt.builtinPayloadsGetByUUID)
+
+		pages.POST("/message-templates", rt.auth(), rt.user(), rt.perm("/notification-templates/add"), rt.messageTemplatesAdd)
+		pages.DELETE("/message-templates", rt.auth(), rt.user(), rt.perm("/notification-templates/del"), rt.messageTemplatesDel)
+		pages.PUT("/message-template/:id", rt.auth(), rt.user(), rt.perm("/notification-templates/put"), rt.messageTemplatePut)
+		pages.GET("/message-template/:id", rt.auth(), rt.user(), rt.perm("/notification-templates"), rt.messageTemplateGet)
+		pages.GET("/message-templates", rt.auth(), rt.user(), rt.messageTemplatesGet)
+		pages.POST("/events-message", rt.auth(), rt.user(), rt.eventsMessage)
+
+		pages.POST("/notify-rules", rt.auth(), rt.user(), rt.perm("/notification-rules/add"), rt.notifyRulesAdd)
+		pages.DELETE("/notify-rules", rt.auth(), rt.user(), rt.perm("/notification-rules/del"), rt.notifyRulesDel)
+		pages.PUT("/notify-rule/:id", rt.auth(), rt.user(), rt.perm("/notification-rules/put"), rt.notifyRulePut)
+		pages.GET("/notify-rule/:id", rt.auth(), rt.user(), rt.perm("/notification-rules"), rt.notifyRuleGet)
+		pages.GET("/notify-rules", rt.auth(), rt.user(), rt.permAny("/notification-rules", "/system/balance-alert"), rt.notifyRulesGet)
+		pages.POST("/notify-rule/test", rt.auth(), rt.user(), rt.perm("/notification-rules"), rt.notifyTest)
+		pages.GET("/notify-rule/custom-params", rt.auth(), rt.user(), rt.perm("/notification-rules"), rt.notifyRuleCustomParamsGet)
+		pages.POST("/notify-rule/event-pipelines-tryrun", rt.auth(), rt.user(), rt.perm("/notification-rules/add"), rt.tryRunEventProcessorByNotifyRule)
+
+		pages.GET("/event-tagkeys", rt.auth(), rt.user(), rt.eventTagKeys)
+		pages.GET("/event-tagvalues", rt.auth(), rt.user(), rt.eventTagValues)
+
+		// 事件Pipeline相关路由
+		pages.GET("/event-pipelines", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.eventPipelinesList)
+		pages.POST("/event-pipeline", rt.auth(), rt.user(), rt.perm("/event-pipelines/add"), rt.addEventPipeline)
+		pages.PUT("/event-pipeline", rt.auth(), rt.user(), rt.perm("/event-pipelines/put"), rt.updateEventPipeline)
+		pages.PUT("/event-pipelines/disabled", rt.auth(), rt.user(), rt.perm("/event-pipelines/put"), rt.updateEventPipelinesDisabled)
+		pages.GET("/event-pipeline/:id", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.getEventPipeline)
+		pages.DELETE("/event-pipelines", rt.auth(), rt.user(), rt.perm("/event-pipelines/del"), rt.deleteEventPipelines)
+		pages.POST("/event-pipeline-tryrun", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.tryRunEventPipeline)
+		pages.POST("/event-processor-tryrun", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.tryRunEventProcessor)
+
+		// API 触发工作流
+		pages.POST("/event-pipeline/:id/trigger", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.triggerEventPipelineByAPI)
+		// SSE 流式执行工作流
+		pages.POST("/event-pipeline/:id/stream", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.streamEventPipeline)
+
+		// 事件Pipeline执行记录路由
+		pages.GET("/event-pipeline-executions", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.listAllEventPipelineExecutions)
+		pages.GET("/event-pipeline/:id/executions", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.listEventPipelineExecutions)
+		pages.GET("/event-pipeline/:id/execution/:exec_id", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.getEventPipelineExecution)
+		pages.GET("/event-pipeline-execution/:exec_id", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.getEventPipelineExecution)
+		pages.GET("/event-pipeline/:id/execution-stats", rt.auth(), rt.user(), rt.perm("/event-pipelines"), rt.getEventPipelineExecutionStats)
+		pages.POST("/event-pipeline-executions/clean", rt.auth(), rt.user(), rt.admin(), rt.cleanEventPipelineExecutions)
+
+		pages.POST("/notify-channel-configs", rt.auth(), rt.user(), rt.perm("/notification-channels/add"), rt.notifyChannelsAdd)
+		pages.DELETE("/notify-channel-configs", rt.auth(), rt.user(), rt.perm("/notification-channels/del"), rt.notifyChannelsDel)
+		pages.PUT("/notify-channel-config/:id", rt.auth(), rt.user(), rt.perm("/notification-channels/put"), rt.notifyChannelPut)
+		pages.GET("/notify-channel-config/:id", rt.auth(), rt.user(), rt.perm("/notification-channels"), rt.notifyChannelGet)
+		pages.GET("/notify-channel-configs", rt.auth(), rt.user(), rt.perm("/notification-channels"), rt.notifyChannelsGet)
+		pages.GET("/simplified-notify-channel-configs", rt.auth(), rt.user(), rt.notifyChannelsGetForNormalUser)
+		pages.GET("/flashduty-channel-list/:id", rt.auth(), rt.user(), rt.flashDutyNotifyChannelsGet)
+		pages.POST("/feishu-visible-chats/:id", rt.auth(), rt.user(), rt.perm("/notification-channels"), rt.feishuVisibleChatsGet)
+		// TODO(dingtalkapp): 钉钉应用本次不上线，dingtalk-group-list 路由先注释；handler 也已注释。
+		// pages.POST("/dingtalk-group-list/:id", rt.auth(), rt.user(), rt.perm("/notification-channels"), rt.dingtalkGroupsGetByNotifyChannel)
+		pages.GET("/pagerduty-integration-key/:id/:service_id/:integration_id", rt.auth(), rt.user(), rt.pagerDutyIntegrationKeyGet)
+		pages.GET("/pagerduty-service-list/:id", rt.auth(), rt.user(), rt.pagerDutyNotifyServicesGet)
+		// 复用 /notification-channels/add 权限而不新增权限串：权限只定义在 cconf.builtInOps，
+		// 未进任何 SQL seed，新增串会导致所有存量部署必须手工授权后功能才可用。
+		pages.POST("/notify-channel-config/test", rt.auth(), rt.user(), rt.perm("/notification-channels/add"), rt.notifyChannelConfigTest)
+		pages.GET("/notify-channel-config", rt.auth(), rt.user(), rt.notifyChannelGetBy)
+		pages.GET("/notify-channel-config/idents", rt.auth(), rt.user(), rt.notifyChannelIdentsGet)
+
+		// saved view 查询条件保存相关路由
+		pages.GET("/saved-views", rt.auth(), rt.user(), rt.savedViewGets)
+		pages.POST("/saved-views", rt.auth(), rt.user(), rt.savedViewAdd)
+		pages.PUT("/saved-view/:id", rt.auth(), rt.user(), rt.savedViewPut)
+		pages.DELETE("/saved-view/:id", rt.auth(), rt.user(), rt.savedViewDel)
+		pages.POST("/saved-view/:id/favorite", rt.auth(), rt.user(), rt.savedViewFavoriteAdd)
+		pages.DELETE("/saved-view/:id/favorite", rt.auth(), rt.user(), rt.savedViewFavoriteDel)
+	}
+
+	r.GET("/api/n9e/versions", func(c *gin.Context) {
+		v := version.Version
+		lastIndex := strings.LastIndex(version.Version, "-")
+		if lastIndex != -1 {
+			v = version.Version[:lastIndex]
+		}
+
+		gv := version.GithubVersion.Load()
+		if gv != nil {
+			ginx.NewRender(c).Data(gin.H{"version": v, "github_verison": gv.(string)}, nil)
+		} else {
+			ginx.NewRender(c).Data(gin.H{"version": v, "github_verison": ""}, nil)
+		}
+	})
+
+	if rt.HTTP.APIForService.Enable {
+		service := r.Group("/v1/n9e")
+		if len(rt.HTTP.APIForService.BasicAuth) > 0 {
+			service.Use(gin.BasicAuth(rt.HTTP.APIForService.BasicAuth))
+		}
+		{
+			service.Any("/prometheus/*url", rt.dsProxy)
+			service.POST("/users", rt.userAddPost)
+			service.PUT("/user/:id", rt.userProfilePutByService)
+			service.DELETE("/user/:id", rt.userDel)
+			service.GET("/users", rt.userFindAll)
+			service.POST("/user-token", rt.getXUserToken)
+
+			service.GET("/user-groups", rt.userGroupGetsByService)
+			service.GET("/user-group-members", rt.userGroupMemberGetsByService)
+
+			service.GET("/targets", rt.targetGetsByService)
+			service.GET("/target/extra-meta", rt.targetExtendInfoByIdent)
+			service.POST("/target/list", rt.targetGetsByHostFilter)
+			service.DELETE("/targets", rt.targetDelByService)
+			service.GET("/targets/tags", rt.targetGetTags)
+			service.POST("/targets/tags", rt.targetBindTagsByService)
+			service.DELETE("/targets/tags", rt.targetUnbindTagsByService)
+			service.PUT("/targets/note", rt.targetUpdateNoteByService)
+			service.PUT("/targets/bgid", rt.targetUpdateBgidByService)
+
+			service.POST("/targets-of-host-query", rt.targetsOfHostQuery)
+
+			service.POST("/alert-rules", rt.alertRuleAddByService)
+			service.POST("/alert-rule-add", rt.alertRuleAddOneByService)
+			service.DELETE("/alert-rules", rt.alertRuleDelByService)
+			service.PUT("/alert-rule/:arid", rt.alertRulePutByService)
+			service.GET("/alert-rule/:arid", rt.alertRuleGet)
+			service.GET("/alert-rules", rt.alertRulesGetByService)
+
+			service.GET("/alert-subscribes", rt.alertSubscribeGetsByService)
+
+			service.GET("/busi-groups", rt.busiGroupGetsByService)
+
+			service.GET("/datasources", rt.datasourceGetsByService)
+			service.GET("/datasource-rsa-config", rt.datasourceRsaConfigGet)
+			service.GET("/datasource-ids", rt.getDatasourceIds)
+			service.POST("/server-heartbeat", rt.serverHeartbeat)
+			service.GET("/servers-active", rt.serversActive)
+
+			service.GET("/recording-rules", rt.recordingRuleGetsByService)
+
+			service.GET("/alert-mutes", rt.alertMuteGets)
+			service.GET("/active-alert-mutes", rt.activeAlertMuteGets)
+			service.POST("/alert-mutes", rt.alertMuteAddByService)
+			service.DELETE("/alert-mutes", rt.alertMuteDel)
+
+			service.GET("/alert-cur-events", rt.alertCurEventsList)
+			service.GET("/alert-cur-events-get-by-rid", rt.alertCurEventsGetByRid)
+			service.GET("/alert-his-events", rt.alertHisEventsList)
+			service.GET("/alert-his-event/:eid", rt.alertHisEventGet)
+
+			service.GET("/task-tpl/:tid", rt.taskTplGetByService)
+			service.GET("/task-tpls", rt.taskTplGetsByService)
+			service.GET("/task-tpl/statistics", rt.taskTplStatistics)
+
+			service.GET("/config/:id", rt.configGet)
+			service.GET("/configs", rt.configsGet)
+			service.GET("/config", rt.configGetByKey)
+			service.GET("/all-configs", rt.configGetAll)
+			service.PUT("/configs", rt.configsPut)
+			service.POST("/configs", rt.configsPost)
+			service.DELETE("/configs", rt.configsDel)
+
+			service.POST("/conf-prop/encrypt", rt.confPropEncrypt)
+			service.POST("/conf-prop/decrypt", rt.confPropDecrypt)
+
+			service.GET("/statistic", rt.statistic)
+
+			service.GET("/notify-tpls", rt.notifyTplGets)
+
+			service.POST("/task-record-add", rt.taskRecordAdd)
+
+			service.GET("/user-variable/decrypt", rt.userVariableGetDecryptByService)
+
+			service.GET("/targets-of-alert-rule", rt.targetsOfAlertRule)
+
+			service.POST("/notify-record", rt.notificationRecordAdd)
+
+			service.GET("/alert-cur-events-del-by-hash", rt.alertCurEventDelByHash)
+
+			service.POST("/center/heartbeat", rt.heartbeat)
+
+			service.GET("/es-index-pattern-list", rt.esIndexPatternGetList)
+
+			service.GET("/notify-rules", rt.notifyRulesGetByService)
+
+			service.GET("/notify-channels", rt.notifyChannelConfigGets)
+
+			service.GET("/message-templates", rt.messageTemplateGets)
+
+			service.GET("/event-pipelines", rt.eventPipelinesListByService)
+			service.POST("/event-pipeline/:id/trigger", rt.triggerEventPipelineByService)
+			service.POST("/event-pipeline/:id/stream", rt.streamEventPipelineByService)
+			service.POST("/event-pipeline-execution", rt.eventPipelineExecutionAdd)
+
+			// 手机号加密存储配置接口
+			service.POST("/users/phone/encrypt", rt.usersPhoneEncrypt)
+			service.POST("/users/phone/decrypt", rt.usersPhoneDecrypt)
+			service.POST("/users/phone/refresh-encryption-config", rt.usersPhoneDecryptRefresh)
+
+			service.GET("/builtin-components", rt.builtinComponentsGets)
+			service.GET("/builtin-payloads", rt.builtinPayloadsGets)
+		}
+	}
+
+	if rt.HTTP.APIForAgent.Enable {
+		heartbeat := r.Group("/v1/n9e")
+		{
+			if len(rt.HTTP.APIForAgent.BasicAuth) > 0 {
+				heartbeat.Use(gin.BasicAuth(rt.HTTP.APIForAgent.BasicAuth))
+			}
+			heartbeat.POST("/heartbeat", rt.heartbeat)
+		}
+	}
+
+	// /system/balance-alert 与 /system/enterprise-balance 走 NoRoute 返回
+	// index.html，由 pub/index.html 的 iframe overlay 挂自定义页。不要把这两条
+	// 路由直接打到内页 HTML，否则刷新会丢掉侧栏，且 UseFileAssets 时仍读
+	// 过期的 statik 副本。
+
+	rt.configNoRoute(r, &statikFS)
+
+}
+
+func Render(c *gin.Context, data, msg interface{}) {
+	if msg == nil {
+		if data == nil {
+			data = struct{}{}
+		}
+		c.JSON(http.StatusOK, gin.H{"data": data, "error": ""})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"error": gin.H{"message": msg}})
+	}
+}
+
+func Dangerous(c *gin.Context, v interface{}, code ...int) {
+	if v == nil {
+		return
+	}
+
+	switch t := v.(type) {
+	case string:
+		if t != "" {
+			c.JSON(http.StatusOK, gin.H{"error": v})
+		}
+	case error:
+		c.JSON(http.StatusOK, gin.H{"error": t.Error()})
+	}
+}
